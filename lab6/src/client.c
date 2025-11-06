@@ -1,8 +1,11 @@
+// client.c - Улучшенная версия с лучшей обработкой ошибок
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <arpa/inet.h>
 
 #include <errno.h>
 #include <getopt.h>
@@ -12,153 +15,269 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "mult_modulo.h"
+
 struct Server {
-  char ip[255];
-  int port;
+    char ip[255];
+    int port;
 };
 
-uint64_t MultModulo(uint64_t a, uint64_t b, uint64_t mod) {
-  uint64_t result = 0;
-  a = a % mod;
-  while (b > 0) {
-    if (b % 2 == 1)
-      result = (result + a) % mod;
-    a = (a * 2) % mod;
-    b /= 2;
-  }
-
-  return result % mod;
-}
+struct ThreadArgs {
+    struct Server server;
+    uint64_t begin;
+    uint64_t end;
+    uint64_t mod;
+    uint64_t result;
+    bool success;
+};
 
 bool ConvertStringToUI64(const char *str, uint64_t *val) {
-  char *end = NULL;
-  unsigned long long i = strtoull(str, &end, 10);
-  if (errno == ERANGE) {
-    fprintf(stderr, "Out of uint64_t range: %s\n", str);
-    return false;
-  }
-
-  if (errno != 0)
-    return false;
-
-  *val = i;
-  return true;
+    char *end = NULL;
+    unsigned long long i = strtoull(str, &end, 10);
+    if (errno == ERANGE) {
+        fprintf(stderr, "Выход за пределы диапазона uint64_t: %s\n", str);
+        return false;
+    }
+    if (errno != 0)
+        return false;
+    *val = i;
+    return true;
 }
 
-int main(int argc, char **argv) {
-  uint64_t k = -1;
-  uint64_t mod = -1;
-  char servers[255] = {'\0'}; // TODO: explain why 255
-
-  while (true) {
-    int current_optind = optind ? optind : 1;
-
-    static struct option options[] = {{"k", required_argument, 0, 0},
-                                      {"mod", required_argument, 0, 0},
-                                      {"servers", required_argument, 0, 0},
-                                      {0, 0, 0, 0}};
-
-    int option_index = 0;
-    int c = getopt_long(argc, argv, "", options, &option_index);
-
-    if (c == -1)
-      break;
-
-    switch (c) {
-    case 0: {
-      switch (option_index) {
-      case 0:
-        ConvertStringToUI64(optarg, &k);
-        // TODO: your code here
-        break;
-      case 1:
-        ConvertStringToUI64(optarg, &mod);
-        // TODO: your code here
-        break;
-      case 2:
-        // TODO: your code here
-        memcpy(servers, optarg, strlen(optarg));
-        break;
-      default:
-        printf("Index %d is out of options\n", option_index);
-      }
-    } break;
-
-    case '?':
-      printf("Arguments error\n");
-      break;
-    default:
-      fprintf(stderr, "getopt returned character code 0%o?\n", c);
-    }
-  }
-
-  if (k == -1 || mod == -1 || !strlen(servers)) {
-    fprintf(stderr, "Using: %s --k 1000 --mod 5 --servers /path/to/file\n",
-            argv[0]);
-    return 1;
-  }
-
-  // TODO: for one server here, rewrite with servers from file
-  unsigned int servers_num = 1;
-  struct Server *to = malloc(sizeof(struct Server) * servers_num);
-  // TODO: delete this and parallel work between servers
-  to[0].port = 20001;
-  memcpy(to[0].ip, "127.0.0.1", sizeof("127.0.0.1"));
-
-  // TODO: work continiously, rewrite to make parallel
-  for (int i = 0; i < servers_num; i++) {
-    struct hostent *hostname = gethostbyname(to[i].ip);
-    if (hostname == NULL) {
-      fprintf(stderr, "gethostbyname failed with %s\n", to[i].ip);
-      exit(1);
+void* ServerThread(void* args) {
+    struct ThreadArgs* thread_args = (struct ThreadArgs*)args;
+    thread_args->success = false;
+    
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(thread_args->server.port);
+    
+    if (inet_pton(AF_INET, thread_args->server.ip, &server_addr.sin_addr) <= 0) {
+        fprintf(stderr, "Неверный адрес: %s\n", thread_args->server.ip);
+        thread_args->result = 0;
+        return NULL;
     }
 
-    struct sockaddr_in server;
-    server.sin_family = AF_INET;
-    server.sin_port = htons(to[i].port);
-    server.sin_addr.s_addr = *((unsigned long *)hostname->h_addr);
-
-    int sck = socket(AF_INET, SOCK_STREAM, 0);
-    if (sck < 0) {
-      fprintf(stderr, "Socket creation failed!\n");
-      exit(1);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        fprintf(stderr, "Ошибка создания сокета!\n");
+        thread_args->result = 0;
+        return NULL;
     }
 
-    if (connect(sck, (struct sockaddr *)&server, sizeof(server)) < 0) {
-      fprintf(stderr, "Connection failed\n");
-      exit(1);
+    // Установка таймаута на подключение (5 секунд)
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    printf("Подключаюсь к серверу %s:%d...\n", thread_args->server.ip, thread_args->server.port);
+    
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        fprintf(stderr, "Ошибка подключения к %s:%d\n", 
+                thread_args->server.ip, thread_args->server.port);
+        close(sock);
+        thread_args->result = 0;
+        return NULL;
     }
 
-    // TODO: for one server
-    // parallel between servers
-    uint64_t begin = 1;
-    uint64_t end = k;
+    printf("Успешно подключен к %s:%d\n", thread_args->server.ip, thread_args->server.port);
 
     char task[sizeof(uint64_t) * 3];
-    memcpy(task, &begin, sizeof(uint64_t));
-    memcpy(task + sizeof(uint64_t), &end, sizeof(uint64_t));
-    memcpy(task + 2 * sizeof(uint64_t), &mod, sizeof(uint64_t));
+    memcpy(task, &thread_args->begin, sizeof(uint64_t));
+    memcpy(task + sizeof(uint64_t), &thread_args->end, sizeof(uint64_t));
+    memcpy(task + 2 * sizeof(uint64_t), &thread_args->mod, sizeof(uint64_t));
 
-    if (send(sck, task, sizeof(task), 0) < 0) {
-      fprintf(stderr, "Send failed\n");
-      exit(1);
+    if (send(sock, task, sizeof(task), 0) < 0) {
+        fprintf(stderr, "Ошибка отправки на %s:%d\n", 
+                thread_args->server.ip, thread_args->server.port);
+        close(sock);
+        thread_args->result = 0;
+        return NULL;
     }
 
     char response[sizeof(uint64_t)];
-    if (recv(sck, response, sizeof(response), 0) < 0) {
-      fprintf(stderr, "Recieve failed\n");
-      exit(1);
+    if (recv(sock, response, sizeof(response), 0) < 0) {
+        fprintf(stderr, "Ошибка получения от %s:%d\n", 
+                thread_args->server.ip, thread_args->server.port);
+        close(sock);
+        thread_args->result = 0;
+        return NULL;
     }
 
-    // TODO: from one server
-    // unite results
-    uint64_t answer = 0;
-    memcpy(&answer, response, sizeof(uint64_t));
-    printf("answer: %llu\n", answer);
+    memcpy(&thread_args->result, response, sizeof(uint64_t));
+    thread_args->success = true;
+    
+    printf("✅ Сервер %s:%d вернул: %lu для диапазона [%lu, %lu]\n",
+           thread_args->server.ip, thread_args->server.port,
+           thread_args->result, thread_args->begin, thread_args->end);
 
-    close(sck);
-  }
-  free(to);
+    close(sock);
+    return NULL;
+}
 
-  return 0;
+int ReadServers(const char* filename, struct Server** servers) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        perror("Ошибка открытия файла серверов");
+        return -1;
+    }
+
+    int capacity = 10;
+    int count = 0;
+    *servers = malloc(sizeof(struct Server) * capacity);
+
+    char line[255];
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\n")] = 0;
+        
+        if (strlen(line) == 0) continue; // Пропускаем пустые строки
+        
+        char* colon = strchr(line, ':');
+        if (!colon) {
+            fprintf(stderr, "Неверный формат сервера: %s\n", line);
+            continue;
+        }
+        
+        *colon = '\0';
+        int port = atoi(colon + 1);
+        
+        if (port <= 0 || port > 65535) {
+            fprintf(stderr, "Неверный порт в строке: %s\n", line);
+            continue;
+        }
+        
+        if (count >= capacity) {
+            capacity *= 2;
+            *servers = realloc(*servers, sizeof(struct Server) * capacity);
+        }
+        
+        strncpy((*servers)[count].ip, line, sizeof((*servers)[count].ip) - 1);
+        (*servers)[count].port = port;
+        count++;
+    }
+
+    fclose(file);
+    return count;
+}
+
+void PrintClientInfo(uint64_t k, uint64_t mod, const char* servers_file) {
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║           КЛИЕНТ ЗАПУЩЕН            ║\n");
+    printf("╠══════════════════════════════════════╣\n");
+    printf("║ k (факториал): %-21lu ║\n", k);
+    printf("║ Модуль: %-28lu ║\n", mod);
+    printf("║ Файл серверов: %-22s ║\n", servers_file);
+    printf("╚══════════════════════════════════════╝\n");
+}
+
+int main(int argc, char **argv) {
+    uint64_t k = 0;
+    uint64_t mod = 0;
+    char servers_file[255] = {'\0'};
+
+    while (true) {
+        static struct option options[] = {
+            {"k", required_argument, 0, 0},
+            {"mod", required_argument, 0, 0},
+            {"servers", required_argument, 0, 0},
+            {0, 0, 0, 0}
+        };
+
+        int option_index = 0;
+        int c = getopt_long(argc, argv, "", options, &option_index);
+
+        if (c == -1) break;
+
+        switch (c) {
+        case 0: {
+            switch (option_index) {
+            case 0:
+                ConvertStringToUI64(optarg, &k);
+                break;
+            case 1:
+                ConvertStringToUI64(optarg, &mod);
+                break;
+            case 2:
+                strncpy(servers_file, optarg, sizeof(servers_file) - 1);
+                break;
+            default:
+                printf("Индекс %d вне диапазона опций\n", option_index);
+            }
+        } break;
+
+        case '?':
+            printf("Ошибка аргументов\n");
+            break;
+        default:
+            fprintf(stderr, "getopt вернул код символа 0%o?\n", c);
+        }
+    }
+
+    if (k == 0 || mod == 0 || !strlen(servers_file)) {
+        fprintf(stderr, "Использование: %s --k 1000 --mod 5 --servers /путь/к/файлу\n",
+                argv[0]);
+        return 1;
+    }
+
+    struct Server* servers = NULL;
+    int servers_num = ReadServers(servers_file, &servers);
+    if (servers_num <= 0) {
+        fprintf(stderr, "Не найдено валидных серверов в файле\n");
+        return 1;
+    }
+
+    PrintClientInfo(k, mod, servers_file);
+    printf("Найдено серверов: %d\n\n", servers_num);
+
+    pthread_t threads[servers_num];
+    struct ThreadArgs thread_args[servers_num];
+
+    uint64_t numbers_per_server = k / servers_num;
+    uint64_t current_start = 1;
+
+    for (int i = 0; i < servers_num; i++) {
+        thread_args[i].server = servers[i];
+        thread_args[i].begin = current_start;
+        thread_args[i].end = (i == servers_num - 1) ? k : current_start + numbers_per_server - 1;
+        thread_args[i].mod = mod;
+        thread_args[i].result = 1;
+        thread_args[i].success = false;
+
+        printf("Сервер %d (%s:%d): числа от %lu до %lu\n", 
+               i, thread_args[i].server.ip, thread_args[i].server.port,
+               thread_args[i].begin, thread_args[i].end);
+
+        current_start = thread_args[i].end + 1;
+
+        if (pthread_create(&threads[i], NULL, ServerThread, &thread_args[i])) {
+            fprintf(stderr, "Ошибка создания потока для сервера %d\n", i);
+            continue;
+        }
+    }
+
+    printf("\n⏳ Ожидание результатов от серверов...\n\n");
+    
+    uint64_t total_result = 1;
+    int successful_servers = 0;
+    
+    for (int i = 0; i < servers_num; i++) {
+        pthread_join(threads[i], NULL);
+        if (thread_args[i].success && thread_args[i].result != 0) {
+            total_result = MultModulo(total_result, thread_args[i].result, mod);
+            successful_servers++;
+        } else {
+            printf("❌ Сервер %d (%s:%d) не вернул результат\n", 
+                   i, thread_args[i].server.ip, thread_args[i].server.port);
+        }
+    }
+
+    printf("\n══════════════════════════════════════\n");
+    printf("Успешных серверов: %d из %d\n", successful_servers, servers_num);
+    printf("Финальный результат: %lu! mod %lu = %lu\n", k, mod, total_result);
+    printf("══════════════════════════════════════\n");
+
+    free(servers);
+    return 0;
 }
